@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: lab8
+data:
+  # Internal service-to-service URLs - Kubernetes Service names, never localhost or a Pod IP.
+  # Same config-driven approach as Lab 7's Docker Compose env vars, just moved into a ConfigMap.
+  USER_SERVICE_URL: "http://user-service:3001"
+  PRODUCT_SERVICE_URL: "http://product-service:3002"
+  ORDER_SERVICE_URL: "http://order-service:3003"
+  GATEWAY_PORT: "3000"
+  USER_PORT: "3001"
+  PRODUCT_PORT: "3002"
+  ORDER_PORT: "3003"

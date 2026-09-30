@@ -1,0 +1,14 @@
+# The only Service in this namespace meant to be reached from outside the cluster - every other
+# service above is ClusterIP (internal only), matching "expose only the gateway externally."
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: lab8
+spec:
+  selector:
+    app: api-gateway
+  ports:
+    - port: 3000
+      targetPort: 3000
+  type: LoadBalancer

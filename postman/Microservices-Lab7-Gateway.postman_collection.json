@@ -1,0 +1,151 @@
+{
+  "info": {
+    "name": "Microservices - Lab 7 (API Gateway)",
+    "description": "Every request goes through the API Gateway (gateway_base), never a service's own port directly - that's the whole point of this lab. gateway_base defaults to the deployed public URL (https://api-gateway-3aa0.onrender.com); switch it to http://localhost:3000 to re-run the same collection against local Compose instead.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "gateway_base", "value": "https://api-gateway-3aa0.onrender.com" },
+    { "key": "userId", "value": "" },
+    { "key": "productId", "value": "" },
+    { "key": "orderId", "value": "" },
+    { "key": "missingId", "value": "64b0000000000000000000ff" }
+  ],
+  "item": [
+    {
+      "name": "Gateway health",
+      "item": [
+        {
+          "name": "GET /health (gateway itself, not proxied)",
+          "request": { "method": "GET", "url": "{{gateway_base}}/health" }
+        }
+      ]
+    },
+    {
+      "name": "User Service (via gateway)",
+      "item": [
+        {
+          "name": "GET /users (200)",
+          "request": { "method": "GET", "url": "{{gateway_base}}/users" }
+        },
+        {
+          "name": "POST /users (201)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status is 201', () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set('userId', pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Aarav Patel\",\n  \"email\": \"aarav@example.com\",\n  \"role\": \"student\"\n}"
+            },
+            "url": "{{gateway_base}}/users"
+          }
+        },
+        {
+          "name": "GET /users/{id} (200)",
+          "request": { "method": "GET", "url": "{{gateway_base}}/users/{{userId}}" }
+        },
+        {
+          "name": "GET /users/{id} - invalid (404)",
+          "request": { "method": "GET", "url": "{{gateway_base}}/users/{{missingId}}" }
+        }
+      ]
+    },
+    {
+      "name": "Product Service (via gateway)",
+      "item": [
+        {
+          "name": "GET /products (200)",
+          "request": { "method": "GET", "url": "{{gateway_base}}/products" }
+        },
+        {
+          "name": "POST /products (201)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status is 201', () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set('productId', pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Mechanical Keyboard\",\n  \"price\": 2499,\n  \"stock\": 25\n}"
+            },
+            "url": "{{gateway_base}}/products"
+          }
+        },
+        {
+          "name": "GET /products/{id} (200)",
+          "request": { "method": "GET", "url": "{{gateway_base}}/products/{{productId}}" }
+        }
+      ]
+    },
+    {
+      "name": "Order Service (via gateway, inter-service calls)",
+      "item": [
+        {
+          "name": "POST /orders - valid (201, Order -> User + Order -> Product)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status is 201', () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set('orderId', pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId}}\",\n  \"productId\": \"{{productId}}\",\n  \"quantity\": 2\n}"
+            },
+            "url": "{{gateway_base}}/orders"
+          }
+        },
+        {
+          "name": "GET /orders (200)",
+          "request": { "method": "GET", "url": "{{gateway_base}}/orders" }
+        },
+        {
+          "name": "GET /orders/{id} (200)",
+          "request": { "method": "GET", "url": "{{gateway_base}}/orders/{{orderId}}" }
+        }
+      ]
+    },
+    {
+      "name": "Gateway error handling",
+      "item": [
+        {
+          "name": "Unreachable service (502) - stop user-service first",
+          "request": { "method": "GET", "url": "{{gateway_base}}/users" },
+          "description": "Run 'docker stop user-service' (local) or pause/scale-to-zero the user-service on Render before sending this. Expect the gateway's own clean 502 JSON, not a hang or a raw connection-reset error. Restart the service and re-send to confirm recovery (200)."
+        },
+        {
+          "name": "Unmatched route (404, gateway's own fallback)",
+          "request": { "method": "GET", "url": "{{gateway_base}}/nope" }
+        }
+      ]
+    }
+  ]
+}

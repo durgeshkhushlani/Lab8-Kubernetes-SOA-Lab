@@ -1,0 +1,17 @@
+# Note: Grafana's own container port is 3000 (its default), same number as the gateway's - that's
+# only a coincidence of two different apps both defaulting to port 3000, not a conflict, since each
+# lives in its own Pod/Service. The Service port here is deliberately 3300 so that if you're using
+# kubectl port-forward for both at once, forwarding Grafana to localhost:3300 never collides with
+# the gateway on localhost:3000.
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: lab8
+spec:
+  selector:
+    app: grafana
+  ports:
+    - port: 3300
+      targetPort: 3000
+  type: LoadBalancer

@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+  namespace: lab8
+spec:
+  selector:
+    app: order-service
+  ports:
+    - port: 3003
+      targetPort: 3003
+  type: ClusterIP
