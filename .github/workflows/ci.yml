@@ -1,4 +1,4 @@
-name: CI
+name: CI/CD
 
 on:
   push:
@@ -7,6 +7,7 @@ on:
     branches: [main]
 
 jobs:
+  # Stage 1 - build & test every service independently (runs on pushes AND pull requests).
   build-test:
     runs-on: ubuntu-latest
     strategy:
@@ -31,3 +32,36 @@ jobs:
 
       - name: Build Docker image
         run: docker build -t ${{ matrix.service }}:${{ github.sha }} ./${{ matrix.service }}
+
+  # Stage 2 - deliver a versioned image to the container registry (GHCR). Only after tests pass,
+  # and only for pushes to main - pull requests build and test but never publish.
+  publish:
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        service: [api-gateway, user-service, product-service, order-service]
+    steps:
+      - uses: actions/checkout@v4
+
+      # GITHUB_TOKEN is created automatically for each run - no password or token is stored in the repo.
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push versioned image (tag = commit SHA)
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER}/${{ matrix.service }}:${{ github.sha }}"
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            -t "$IMAGE" ./${{ matrix.service }}
+          docker push "$IMAGE"
+          echo "Pushed $IMAGE"

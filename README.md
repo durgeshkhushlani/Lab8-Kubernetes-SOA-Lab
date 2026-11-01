@@ -22,15 +22,26 @@ moves into Kubernetes.
   enough for the CI workflow's "run tests" step to mean something real, not a placeholder that always
   passes: it actually asserts on schema shape (required fields, the unique-email index) and module exports.
 - `k8s/` - Kubernetes manifests for all four services plus Prometheus/Grafana.
-- `.github/workflows/ci.yml` - checkout, install, test, Docker build, matrixed across all four services.
+- `.github/workflows/ci.yml` - a CI/CD workflow: checkout, install, test and Docker build for all four
+  services, then publishing a **versioned (commit-SHA-tagged) image of each service to GitHub Container
+  Registry**. The cluster is then moved onto one of those images with a rolling update (see "CI/CD").
+- Health/readiness probes on every Deployment, documented below.
 
 ## Kubernetes environment used
 
-_Fill in once set up:_ Docker Desktop's built-in Kubernetes (simplest for local development - shares the
-same Docker image cache used to build `*.:v1` images in Labs 5-7, and its `LoadBalancer` Services map
-straight to `localhost` with no extra tooling) **or** a cloud cluster (GKE/EKS/AKS) if used instead - if so,
-image names in the manifests need to point at a pushed registry image (e.g. Docker Hub) rather than a local
-tag, since a cloud cluster's nodes can't see images that only exist in a local Docker Desktop cache.
+**Docker Desktop's built-in Kubernetes**, single node, provisioned with **kubeadm** (Kubernetes v1.36.1),
+context name `docker-desktop`. Chosen because it shares Docker Desktop's image cache - images built locally
+as `*:v1` are usable straight away with `imagePullPolicy: IfNotPresent` - and because its `LoadBalancer`
+Services map straight to `localhost` with no extra tooling. (Docker Desktop also offers a `kind`-based
+provisioner; it needs the separate containerd image store enabled to see locally built images, so kubeadm
+was the simpler choice here.)
+
+Prerequisites: Docker Desktop with Kubernetes enabled (Settings -> Kubernetes), `kubectl` on the PATH, a
+MongoDB Atlas cluster (external to the cluster, same as Lab 7), a GitHub repository (for Actions + GHCR), and
+Postman. To access the cluster: `kubectl config current-context` must print `docker-desktop`.
+
+A cloud cluster (GKE/EKS/AKS) would work the same way, with one difference: its nodes can't see images that
+only exist in a local Docker cache, so the Deployments would reference the registry images from the start.
 
 ## Namespace, ConfigMap, Secret
 
@@ -136,13 +147,104 @@ endpoint list for a Service means its selector doesn't match any Pod's labels at
 endpoints listed but requests still failing usually means the Pods exist but aren't passing their readiness
 probe yet.
 
-## GitHub Actions CI
+## Health & readiness probes
 
-`.github/workflows/ci.yml` runs on every push/PR to `main`, matrixed across all four services
-(`api-gateway`, `user-service`, `product-service`, `order-service`) so the same four steps - checkout,
-`npm ci`, `npm test`, `docker build` - run independently for each one and a failure in one service's tests
-doesn't hide a problem in another's. `npm test` runs each service's real `test/smoke.test.js` via Node's
-built-in test runner (`node --test`) - no external test framework needed.
+Every Deployment (gateway, user, product, order) declares both probes against the service's existing
+`GET /health` endpoint (e.g. `k8s/user-deployment.yaml`):
+
+```yaml
+readinessProbe:
+  httpGet: { path: /health, port: 3001 }
+  initialDelaySeconds: 5
+  periodSeconds: 5
+livenessProbe:
+  httpGet: { path: /health, port: 3001 }
+  initialDelaySeconds: 15
+  periodSeconds: 10
+```
+
+**Expected behavior:**
+
+- **Readiness** answers "may this Pod receive traffic yet?". The services only start listening *after*
+  `mongoose.connect()` to Atlas succeeds, so a new Pod reports `READY 0/1` until it is actually connected,
+  then flips to `1/1` and only then is added to the Service's endpoints. This was visible live when
+  `user-service` was scaled from 1 to 3 replicas: the two new Pods showed `0/1 Running` for a few seconds
+  before becoming `1/1`.
+- During a **rolling update** this is what keeps the system available: Kubernetes starts the replacement Pod,
+  waits for it to pass readiness, and only then terminates an old one - a Pod that hasn't connected to the
+  database never receives a request.
+- **Liveness** answers "is this process still healthy?". If `/health` stops answering for several
+  consecutive checks, the kubelet restarts the container - a hung process recovers without anyone
+  intervening. (Self-healing for a *deleted* Pod is a different mechanism - the Deployment controller - shown
+  in the self-healing section above.)
+
+Verify a Pod reports Ready and see the probe settings Kubernetes is actually using:
+
+```
+kubectl get pods -n lab8
+kubectl describe pod <pod-name> -n lab8 | findstr /i "Liveness Readiness Ready"
+```
+
+(`findstr` is the Windows `cmd` equivalent of `grep`; on Linux/macOS use `| grep -iE "liveness|readiness|ready"`.)
+
+## GitHub Actions CI/CD
+
+Flow: **Git push -> build/test -> Docker image -> container registry -> Kubernetes rollout -> verification.**
+`.github/workflows/ci.yml` implements the first four stages automatically; the last two are a short,
+documented `kubectl` procedure (explained below).
+
+| Stage | Job | What happens | Runs on |
+|---|---|---|---|
+| Build & test | `build-test` (matrixed over `api-gateway`, `user-service`, `product-service`, `order-service`) | checkout, `npm ci`, `npm test` (each service's real `test/smoke.test.js` via Node's built-in runner), `docker build` | every push **and** pull request to `main` |
+| Registry delivery | `publish` (same matrix, `needs: build-test`) | log in to GHCR with the run's automatic `GITHUB_TOKEN`, build, and push a versioned image | pushes to `main` only - pull requests never publish |
+
+The matrix means each service builds, tests and publishes independently, and a failing test in one service
+fails only that leg instead of hiding behind another's green result.
+
+### Registry & image naming/tagging
+
+- **Registry:** GitHub Container Registry (`ghcr.io`) - no extra account or stored password, because the
+  workflow authenticates with the per-run `GITHUB_TOKEN` (`permissions: packages: write` on the `publish`
+  job only).
+- **Name:** `ghcr.io/<github-owner>/<service>:<tag>`, e.g.
+  `ghcr.io/durgeshkhushlani/user-service:<tag>` (the owner is lower-cased by the workflow, since GHCR
+  requires lowercase).
+- **Tag:** the full **Git commit SHA** (`${{ github.sha }}`) - every image traces back to exactly one commit,
+  and a tag is never reused, so "what is running?" always has a precise answer. (Local baseline images
+  from earlier in this lab keep their simple `v1` tag.)
+- Each image carries an `org.opencontainers.image.source` label pointing at this repository, which is what
+  links the package to the repo in GitHub's UI.
+- **No secrets in images:** `.dockerignore` excludes `.env`; the MongoDB URIs reach containers only through
+  the Kubernetes `Secret` at run time.
+
+### Kubernetes image update / rollout procedure
+
+The GitHub-hosted runner cannot reach a cluster that lives on `localhost` inside Docker Desktop, so the
+last stage is performed by hand against the local cluster (with a cloud cluster this would be one more
+workflow job using a kubeconfig stored as a repository secret). This is "continuous *delivery*" - CI produces
+and delivers a validated, versioned artifact; a person decides when to roll it out.
+
+1. Push to `main`; wait for the `publish` jobs to finish (Actions tab).
+2. The package must be readable by the cluster: in GitHub -> Packages -> `<service>` -> Package settings,
+   set visibility to **Public** (the images contain no secrets), otherwise the pull fails with
+   `ImagePullBackOff` (a private package would need an `imagePullSecret`).
+3. Take the commit SHA that was published: `git rev-parse HEAD` (or copy it from the package's tag list).
+4. Roll the Deployment onto that image:
+
+```
+kubectl set image deployment/user-service user-service=ghcr.io/durgeshkhushlani/user-service:<full-commit-sha> -n lab8
+kubectl rollout status deployment/user-service -n lab8
+kubectl get pods -n lab8 -l app=user-service
+kubectl describe deployment user-service -n lab8 | findstr /i "Image"
+```
+
+5. `rollout status` ends with `successfully rolled out`; `get pods` shows the old Pods being replaced one
+   at a time (the default `RollingUpdate` strategy - readiness probes gate each step); `describe` shows the
+   new image reference. To undo: `kubectl rollout undo deployment/user-service -n lab8`.
+6. Verify end to end: `GET /users` through the gateway still returns `200`.
+
+Note: after `kubectl set image` the live Deployment is intentionally ahead of the YAML in `k8s/`, which still
+describes the local `user-service:v1` baseline - that is the normal consequence of an imperative rollout.
 
 ## Prometheus
 
@@ -165,6 +267,27 @@ Access Prometheus the same way as the gateway (`LoadBalancer` → `localhost:909
 - Query `up{job=~"api-gateway|user-service|product-service|order-service"}` - `1` per target.
 - Query `rate(http_requests_total[5m])` - request rate per service/route, should visibly rise after
   generating Postman traffic.
+
+### Application metrics vs. infrastructure metrics
+
+- **Application metrics** (what the dashboard is built around): request rate, error rate and latency from
+  `http_requests_total` / `http_request_duration_seconds`, exposed by each service at `/metrics`. These answer
+  "is the *system* working for its users?".
+- **Basic workload health:** the `up` metric per target (Prometheus can scrape the Pod behind each Service),
+  together with the Kubernetes-side signals already covered in this README - Deployment `READY` counts,
+  readiness/liveness probes, and Pod restarts in `kubectl get pods`. `prom-client`'s default metrics
+  (`process_resident_memory_bytes`, `process_cpu_seconds_total`, event-loop lag) are also being collected per
+  service and can be queried the same way.
+- **Infrastructure metrics** (Pod/container/node CPU & memory from the kubelet, Deployment replica state as
+  metrics) would need extra components - cAdvisor/kubelet scraping, `kube-state-metrics`, `node-exporter`,
+  usually installed together as `kube-prometheus-stack`. They are deliberately out of scope for this lab,
+  which prioritizes application request/error/latency metrics.
+
+**Scrape-target caveat:** Prometheus targets the `ClusterIP` Service name (e.g. `user-service:3001`, same
+style as the handout's `gateway-service:8080` example), so with several replicas each scrape lands on
+whichever Pod the Service picks. Per-Pod series would need Kubernetes service discovery
+(`kubernetes_sd_configs` plus RBAC) - an easy next step, but not needed for the availability/traffic/error/
+latency questions this lab asks.
 
 ## Grafana
 
@@ -227,8 +350,31 @@ port-forwarding both the gateway and Grafana at once never collides).
                       all of the above inside namespace: lab8
 ```
 
+### Delivery pipeline (how a code change reaches the cluster)
+
+```
+ git push to main
+        │
+        ▼
+ GitHub Actions  ── build-test (x4 services) ──▶ npm ci · npm test · docker build
+        │  (all four green)
+        ▼
+ publish (x4) ──▶ GHCR:  ghcr.io/durgeshkhushlani/<service>:<commit-SHA>      <- versioned image
+        │
+        ▼   kubectl set image deployment/<service> <service>=ghcr.io/...:<commit-SHA> -n lab8
+ Kubernetes (namespace lab8): rolling update, each new Pod gated by its readiness probe
+        │
+        ▼
+ Verify: kubectl rollout status · GET /users through the gateway · Prometheus/Grafana keep scraping
+```
+
 ## Troubleshooting
 
+- **`ImagePullBackOff` after rolling out a registry image** - the most likely cause is that the GHCR package
+  is still *private* (new packages default to private), so the cluster's anonymous pull is rejected. Check
+  with `kubectl describe pod <pod> -n lab8` (Events section). Fix: set the package's visibility to Public
+  (it contains no secrets) or add an `imagePullSecret`. `kubectl rollout undo deployment/<service> -n lab8`
+  returns to the previous working image in the meantime.
 - **`kubectl apply -f k8s/` silently overwrote the real `mongo-secrets` Secret with placeholder values** the
   first time this was applied - the template file `mongo-secret.example.yaml` was originally sitting
   directly inside `k8s/`, and `kubectl apply -f k8s/` applies every YAML file in that folder (not
@@ -255,9 +401,29 @@ port-forwarding both the gateway and Grafana at once never collides).
   Desktop fully, rename (don't delete) that stuck file/folder, relaunch - documented in detail in the Lab 5
   README.
 
-## Submission checklist cross-reference
+## Evidence (screenshots/)
 
-Every item in the handout's Section 7.1 evidence table is covered by a screenshot in `screenshots/` (see
-that folder) plus the source-of-truth files already in this repo: manifests in `k8s/`, the CI workflow in
-`.github/workflows/ci.yml`, the Grafana dashboard definition in
-`k8s/monitoring/grafana-dashboard-configmap.yaml`, and the architecture diagram above.
+| # | Handout evidence | Screenshot / file |
+|---|---|---|
+| 1 | Lab 7 baseline | `01-lab7-baseline-health` |
+| 2 | Kubernetes environment (context + node) | `02-kubectl-context-nodes` |
+| 3 | Manifests (gateway, services, configuration) | the YAML files in `k8s/` (`k8s/templates/` holds the secret *template* only) |
+| 4 | Deployment (Pods, Deployments, Services in `lab8`) | `03-deployments-pods-services` |
+| 5 | Gateway test through Kubernetes | `04a-gateway-service`, `04b-postman-users`, `04c-postman-orders` |
+| 6 | Scaling `user-service` to 3 replicas | `05-scaling-3-replicas` |
+| 7 | Self-healing | `self-healing-before-after` |
+| 8 | Troubleshooting (describe / logs / endpoints) | `troubleshooting-describe-logs-endpoints` |
+| 9 | GitHub Actions run | `github-actions-ci-run` (first CI run), `github-actions-cicd-run` (CI/CD run with the `publish` jobs) |
+| 10 | Prometheus targets + query | `prometheus-targets`, `prometheus-query-up` |
+| 11 | Grafana dashboard | `grafana-dashboard-initial` |
+| 12 | Traffic observed in monitoring | `grafana-dashboard-after-traffic` |
+| 13 | Architecture | `architecture-diagram` (the pipeline diagram above is the delivery-flow companion) |
+| new | Probe configuration + Pod Ready | `probes-config-and-ready` |
+| new | Versioned image in the container registry | `ghcr-versioned-image` |
+| new | Kubernetes rollout to the new image | `rollout-user-service-new-image` |
+
+Also required by the handout, covered in this README: container registry naming/tagging approach and the CI/CD
+stages with the rollout procedure ("GitHub Actions CI/CD" above), and the probe configuration and expected
+behavior ("Health & readiness probes" above). No credentials are committed: `.env` files and
+`k8s/mongo-secret.yaml` are git-ignored, the Secret is created on the cluster with `kubectl create secret`, and
+GHCR is accessed with the per-run `GITHUB_TOKEN`.

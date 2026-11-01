@@ -134,13 +134,28 @@
       ]
     },
     {
-      "name": "Gateway error handling",
+      "name": "Gateway failure test (handout exercise)",
+      "description": "Run top to bottom against the LOCAL Docker Compose stack. Needs {{userId}} to exist first - run 'POST /users (201)' in the User Service folder once beforehand. Steps 2 and 4 are done in a terminal, not Postman.",
       "item": [
         {
-          "name": "Unreachable service (502) - stop user-service first",
-          "request": { "method": "GET", "url": "{{gateway_base}}/users" },
-          "description": "Run 'docker stop user-service' (local) or pause/scale-to-zero the user-service on Render before sending this. Expect the gateway's own clean 502 JSON, not a hang or a raw connection-reset error. Restart the service and re-send to confirm recovery (200)."
+          "name": "Step 2 - GET /users/{id} through gateway, all services up (expect 200)",
+          "request": { "method": "GET", "url": "{{gateway_base}}/users/{{userId}}" }
         },
+        {
+          "name": "Step 4-5 - SAME request after 'docker stop user-service' (expect 502, no hang)",
+          "request": { "method": "GET", "url": "{{gateway_base}}/users/{{userId}}" },
+          "description": "Before sending: run 'docker stop user-service' in a terminal. The gateway must answer immediately with its own clean 502 JSON ({error:{status:502,message:'user-service is unreachable'}}), not hang and not crash."
+        },
+        {
+          "name": "Step 6 - SAME request after 'docker start user-service' (expect 200, recovery)",
+          "request": { "method": "GET", "url": "{{gateway_base}}/users/{{userId}}" },
+          "description": "Before sending: run 'docker start user-service', wait ~10s for it to reconnect to MongoDB. The same id returns 200 again - user-db was never stopped, so the data is still there."
+        }
+      ]
+    },
+    {
+      "name": "Gateway error handling (extra)",
+      "item": [
         {
           "name": "Unmatched route (404, gateway's own fallback)",
           "request": { "method": "GET", "url": "{{gateway_base}}/nope" }
